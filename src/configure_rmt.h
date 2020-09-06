@@ -6,6 +6,8 @@
 #include "driver/rmt.h"
 #include "esp_log.h"
 
+#include "PinOut.h"
+
 
 // receiver pulse length ranges from 8000 to 16000 centered around 12000
 #define RECEIVER_CH_MIN 8000

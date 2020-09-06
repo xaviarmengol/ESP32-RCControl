@@ -12,7 +12,7 @@ external interrupt #0 pin.
 #include "MPU6050_6Axis_MotionApps20.h"
 #include "Wire.h"
 
-#define INTERRUPT_PIN 5 
+#define INTERRUPT_PIN 4 
 
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
 

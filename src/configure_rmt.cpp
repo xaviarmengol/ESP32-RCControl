@@ -5,11 +5,10 @@
 // - Reading the pulse widths of the servo signal from the RC receiver
 // - Reading the pulse widths of the hall effect sensors in the motor
 
-static const char* TAG = "RMT";
 
 volatile uint16_t ReceiverChannels[RECEIVER_CHANNELS_NUM] = {0};
 const uint8_t RECEIVER_CHANNELS[RECEIVER_CHANNELS_NUM] = { 1, 2 };
-const uint8_t RECEIVER_GPIOS[RECEIVER_CHANNELS_NUM] = { 4, 16 };
+const uint8_t RECEIVER_GPIOS[RECEIVER_CHANNELS_NUM] = { INPUT_STEERING, INPUT_VEL };
 
 static void rmt_isr_handler(void* arg){
     // with reference to https://www.esp32.com/viewtopic.php?t=7116#p32383
@@ -80,6 +79,8 @@ uint16_t rmtValueRaw(int channel) {
     // 8000 - 12000 - 16000
     if (channel < RECEIVER_CHANNELS_NUM) {
         return(ReceiverChannels[channel]);
+    } else {
+        return(0);
     }
 }
 
