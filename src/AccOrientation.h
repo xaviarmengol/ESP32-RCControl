@@ -196,8 +196,7 @@ void AccOrientation::update() {
         yawRateStab = gy.z / 131.0; // (250.0 / 32750.0);
 
         yawAngleStab = ypr[0] * RAD_TO_DEG - _yprReference;
-        if (yawAngleStab < -180.0 ) yawAngleStab += 360.0;
-        else if (yawAngleStab > 180.0) yawAngleStab -= 360.0;
+
     }
 
 }

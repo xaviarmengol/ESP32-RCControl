@@ -16,15 +16,11 @@ const float codeVersion = 0.2; // Software revision
 #include "AccOrientation.h"
 #include "wifiUtils.h"
 #include "configure_rmt.h" // RMT (instead of exceptions)
-
 #include "SharedVar.h"
-
 #include "filtreentrada.hpp"
-
 #include "PinOut.h"
-
 #include "MediumFilter.h"
-//
+
 
 // Create Servo objects
 Servo servoSteering;
@@ -39,28 +35,19 @@ int limuSecL = 1500, limuSecR = 1500; // usually 1000 - 2000 uSec (1500 uSec is 
 
 
 // DANGER!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// In case of full Auto in Velocity, receiver should be configured WITHOUT REVERSE!!!!!
 
 // Move velocity: CALIBRATE BY HAND
-
 // CenterVel depends if 50%-50% or 30%-70%
 int limuSecVelFordward = 1976, limuSecVelReverse = 980, uSecVelCenter=1470; // usually 1000 - 2000 uSec
 int uSecVelDeadBand = 10;
 
 
 // MRSC gain
-//byte mrscGain = 90; // 80 This MRSC gain applies, if you don't have an adjustment pot and don't call readInputs()
+//int mrscGain = 90; // 80 This MRSC gain applies, if you don't have an adjustment pot and don't call readInputs()
 double headingMultiplier = 1.0; // adjust until front wheels stay in parallel with the ground, if the car is swiveled around
-
-int generalMrscGain = 1; // 0 Disabled 1 Enabled
-
-// Switch states
-boolean mpuInversed = false;
 
 
 unsigned long lastTimeDebug=0;
-unsigned long lastTimeBlynk=0;
-unsigned long periodBlynk=500;
 
 unsigned long debugPeriod=5000;
 
@@ -69,7 +56,7 @@ unsigned long debugPeriod=5000;
 unsigned long lastTimeDebugMain=0;
 unsigned long periodDebugMain=2000;
 
-// New MPU library
+// MPU library
 
 AccOrientation mpu;
 
@@ -78,6 +65,7 @@ AccOrientation mpu;
 bool enableSystemInput = false;
 
 // Debug
+
 template <class T>
 void debug (String text, T value) {
     Serial.print(text);
@@ -105,13 +93,18 @@ bool enableRemote = true;
 
 // Medium Filters
 
-MediumFilter<int> steeringFilter(1500);
-MediumFilter<int> velFilter(1500);
+MediumFilter<int> steering(1500);
+MediumFilter<int> vel(1500);
 
 // Tasks definition
 
 TaskHandle_t handTskWifi;
 void tskWifi (void *pvParameters);
+
+TaskHandle_t handTskLoop;
+void tskLoop (void *pvParameters);
+
+
 
 ///////////////////////////////////////////////////////////////////////////////////
 
@@ -137,10 +130,10 @@ void setup() {
     pinMode(INPUT_3, INPUT_PULLUP);
     pinMode(INPUT_4, INPUT_PULLUP);
 
-    inputFiltered[0].configura(INPUT_1, INPUT_PULLUP);
-    inputFiltered[1].configura(INPUT_2, INPUT_PULLUP);
-    inputFiltered[2].configura(INPUT_3, INPUT_PULLUP);
-    inputFiltered[3].configura(INPUT_4, INPUT_PULLUP);
+    inputFiltered[0].configura(INPUT_1, 50);
+    inputFiltered[1].configura(INPUT_2, 50);
+    inputFiltered[2].configura(INPUT_3, 50);
+    inputFiltered[3].configura(INPUT_4, 50);
     
     // Servo pins
     servoSteering.attach(OUTPUT_STEERING);
@@ -157,15 +150,18 @@ void setup() {
 
     rmtInit();
 
-    if (wifiEnabled) InitWifi();
+    // State Machine
 
-    if (wifiEnabled) Blynk.config(auth);
+    gMode.set(3);
+    enableSystem.set(1);
 
     xTaskCreateUniversal(tskWifi, "TaskWifi", 10000, NULL, 1, &handTskWifi, 0);
     delay(500);
 
-    debug<int>("Ready to Run!", 1);
+    xTaskCreateUniversal(tskLoop, "TaskLoop", 10000, NULL, 1, &handTskLoop, 1);
+    delay(500);
 
+    debug<int>("Ready to Run!", 1);
 }
 
 
@@ -184,7 +180,6 @@ void detectSteeringRange() {
 
 void readInputs() {
     mrscGain.set(map(analogRead(GAIN_POT), 0, 1024*4, 0, 100));
-    //mpuInversed = !digitalRead(INVERSE_MPU_DIRECTION);
 
     for(int i=0; i<4; i++){
         gInp[i].set(inputFiltered[i].value());    
@@ -208,13 +203,13 @@ void controlMrsc() {
     mpu.update();
 
     // Compute steering compensation overlay
-    int steeringPWMFiltered = steeringFilter.feedAndReturn(rmtValuePWM(0));
-    int turnRateSetPoint = map(steeringPWMFiltered, limuSecL, limuSecR, -50, 50);  // turnRateSetPoint = steering angle (1000 to 2000us) = -50 to 50
-    int steering = abs(turnRateSetPoint); // this value is required to compute the gain later on and is always positive
+    int steeringPWMFiltered = steering.filter(rmtValuePWM(0));
+    int turnRateSetPoint = map(steeringPWMFiltered, limuSecL, limuSecR, -50, 50); 
+    int steering = abs(turnRateSetPoint);
     int gain = map(steering, 0, 50, mrscGainValue, (mrscGainValue / 5)); // MRSC gain around center position is 5 times more!
 
     // Compute velocity Set Point in Eng.Units
-    int velPWMFiltered = velFilter.feedAndReturn(rmtValuePWM(1));
+    int velPWMFiltered = vel.filter(rmtValuePWM(1));
     int uSecVel = velPWMFiltered;
     if (uSecVel < uSecVelCenter) uSecVel = uSecVelCenter; // If breaking (or reverse?), velSetPoint = 0;
     int velSetPoint = map(uSecVel, uSecVelCenter, limuSecVelFordward, 0, 100);
@@ -229,12 +224,7 @@ void controlMrsc() {
         mpu.resetYawStab();
     }
 
-
-    if (mpuInversed) steeringAngle = turnRateSetPoint + (gyroFeedback * gain / 100) * generalMrscGain;  // Compensation depending on the pot value
-    else steeringAngle = turnRateSetPoint - (gyroFeedback * gain / 100) * generalMrscGain;
-
-    int mpuInversedRatio = 1;
-    if (mpuInversed) mpuInversedRatio = -1;
+    steeringAngle = turnRateSetPoint - (gyroFeedback * gain / 100);
 
     // TODO
     // Alternativa !!! amb calcul teòric
@@ -262,10 +252,8 @@ void controlMrsc() {
         lastTimeDebug = millis();
     }
 
-    gValuePWMRot = rmtValuePWM(0); 
-    gValuePWMVel = rmtValuePWM(1);
-
-    if (wifiEnabled) Blynk.run();
+    gValuePWMRot.set(rmtValuePWM(0)); 
+    gValuePWMVel.set(rmtValuePWM(1));
 
 }
 
@@ -275,8 +263,8 @@ void controlOff() {
 }
 
 void controlManual() {
-    servoSteering.writeMicroseconds(gManTurn);
-    servoVelocity.writeMicroseconds(gManVel);
+    servoSteering.writeMicroseconds(gManTurn.get());
+    servoVelocity.writeMicroseconds(gManVel.get());
 
 }
 
@@ -285,59 +273,25 @@ void controlDirect() {
     servoVelocity.writeMicroseconds(rmtValuePWM(1));
 }
 
-//
-// =======================================================================================================
-// MAIN LOOP
-// =======================================================================================================
-//
-
-void loop() {
-
-    readInputs(); // Read pots and switches
-
-    detectSteeringRange(); // Detect the steering input signal range
-
-    periodBlynk = 500;
-
-    if (gMode == 1) {
-        controlOff();
-    } else if (gMode == 2) {
-        controlDirect();
-    } else if (gMode == 3) {
-        controlMrsc();
-    } else if (gMode == 4) {
-        controlManual();
-        periodBlynk = 10;
-    } 
-
-    // TODO: Refactor with tasks
-
-    if ((millis() - lastTimeBlynk) > periodBlynk) {
-
-        gValuePWMRot = rmtValuePWM(0);
-        gValuePWMVel = rmtValuePWM(1);
-
-        if (wifiEnabled) Blynk.run();
-
-        lastTimeBlynk = millis();
-    }
+void enableManagment() {
 
     // Enable system control
 
     // TODO: Refactor
 
-    if (gValuePWMVel < 1100 && !stateChangingEnable) {
+    if (gValuePWMVel.get() < 1100 && !stateChangingEnable) {
         stateChangingEnable = true;
         initTimeInStateChangingEnable = millis();
-    } else if (stateChangingEnable && gValuePWMVel < 1100 ){
+    } else if (stateChangingEnable && gValuePWMVel.get() < 1100 ){
         if ((millis() - initTimeInStateChangingEnable) > 2000) {
             enableRemote = !enableRemote;
             stateChangingEnable = false;
         }
-    } else if (stateChangingEnable && gValuePWMVel >= 1100) {
+    } else if (stateChangingEnable && gValuePWMVel.get() >= 1100) {
         stateChangingEnable = false;
     }
 
+    // TODO: Hardware filter
 
     if (digitalRead(ENABLE_CONTROL_INPUT) == 1) {
         enableSystemInput = true;
@@ -345,7 +299,7 @@ void loop() {
         enableSystemInput = false;
     }
     
-    if (enableSystem && enableSystemInput && enableRemote) {
+    if (enableSystem.get() && enableSystemInput && enableRemote) {
         digitalWrite(ENABLE_CONTROL, LOW);
     } else {
         digitalWrite(ENABLE_CONTROL, HIGH);
@@ -356,7 +310,58 @@ void loop() {
     for(int i=0; i<4; i++){
         inputFiltered[i].update();         
     }
-    
+
+}
+
+
+// =======================================================================================================
+// MAIN LOOP
+// =======================================================================================================
+
+
+void loop() {
+
+}
+
+
+//
+// =======================================================================================================
+// TASK LOOP
+// =======================================================================================================
+//
+
+
+void tskLoop(void *pvParameters){
+
+    // SETUP or the task
+    Serial.println("Task Loop on core: " + String(xPortGetCoreID()));
+
+
+
+    // Timers Loop Task
+
+    TickType_t lastTimeTaskLoop;
+    TickType_t periodTaskLoop = pdMS_TO_TICKS(10);
+
+    while(true) {
+        
+        readInputs(); // Read pots and switches
+
+        detectSteeringRange(); // Detect the steering input signal range
+
+        if (gMode.get() == 1) {
+            controlOff();
+        } else if (gMode.get() == 2) {
+            controlDirect();
+        } else if (gMode.get() == 3) {
+            controlMrsc();
+        } else if (gMode.get() == 4) {
+            controlManual();
+        } 
+
+        vTaskDelayUntil(&lastTimeTaskLoop, periodTaskLoop);
+    }
+
 }
 
 
@@ -371,8 +376,14 @@ void tskWifi(void *pvParameters){
     // SETUP or the task
     Serial.println("Task Wifi on core: " + String(xPortGetCoreID()));
 
+    if (wifiEnabled) InitWifi();
+    if (wifiEnabled) Blynk.config(auth);
+
     TickType_t lastTimeDebugWifi;
     TickType_t periodDebugWifi = pdMS_TO_TICKS(2000);
+
+    unsigned long lastTimeBlynk=0;
+    unsigned long periodBlynk=500;
 
     while(true){
 
@@ -380,6 +391,17 @@ void tskWifi(void *pvParameters){
             Serial.println(gInp[i].get());    
         }
         Serial.println(mrscGain.get());
+
+
+        if ((millis() - lastTimeBlynk) > periodBlynk) {
+
+            gValuePWMRot.set(rmtValuePWM(0));
+            gValuePWMVel.set(rmtValuePWM(1));
+
+            if (wifiEnabled) Blynk.run();
+
+            lastTimeBlynk = millis();
+        }
 
         vTaskDelayUntil(&lastTimeDebugWifi, periodDebugWifi);
     }

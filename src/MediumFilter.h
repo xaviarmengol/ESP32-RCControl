@@ -11,7 +11,7 @@ class MediumFilter{
             }
         };
 
-        T feedAndReturn(T value) {
+        T filter(T value) {
             T returnValue;
 
             // Dischard last value and feed the pipe
