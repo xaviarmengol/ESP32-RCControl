@@ -1,6 +1,8 @@
 #include "configure_rmt.h"
 #include <Arduino.h>
 
+#include "pinOut.h"
+
 // this file configure the RMT for 2 purposes:
 // - Reading the pulse widths of the servo signal from the RC receiver
 // - Reading the pulse widths of the hall effect sensors in the motor

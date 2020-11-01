@@ -1,13 +1,10 @@
 #ifndef CONFIGURE_RMT
 #define CONFIGURE_RMT
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+//#include "freertos/FreeRTOS.h"
+//#include "freertos/task.h"
 #include "driver/rmt.h"
-#include "esp_log.h"
-
-#include "PinOut.h"
-
+//#include "esp_log.h"
 
 // receiver pulse length ranges from 8000 to 16000 centered around 12000
 #define RECEIVER_CH_MIN 8000

@@ -2,67 +2,45 @@
 
 const float codeVersion = 0.2; // Software revision
 
-//
-// =======================================================================================================
-// LIBRARIES
-// =======================================================================================================
-//
-
 #include <Arduino.h>
 #include <Wire.h> 
 #include <ESP32Servo.h>
 
-#include "blynkConf.h"
-#include "AccOrientation.h"
-#include "wifiUtils.h"
+#include <Adafruit_I2CDevice.h> //??
+
+// Support Classes
+#include "AccOrientation.hpp"
+#include "Filtreentrada.hpp"
+#include "MediumFilter.hpp"
+#include "ParametersMgmt.hpp"
+#include "ParametersMgmtShared.hpp"
+#include "SharedVar.hpp"
+
+// Global information
+#include "globalVars.h"
+#include "pinOut.h"
+
 #include "configure_rmt.h" // RMT (instead of exceptions)
-#include "SharedVar.h"
-#include "filtreentrada.hpp"
-#include "PinOut.h"
-#include "MediumFilter.h"
+#include "controlSystem.h"
 
+#include "blynkConf.h"
+#include "wifiUtils.h"
 
-// Create Servo objects
-Servo servoSteering;
-Servo servoVelocity;
+// Includes for GUI
 
-// Servo limits (initial value = center position = 90° / 1500uSec)
-// Limits are adjusted during the first steering operation!
+#include "Screen.h"
+#include "ButtonInfoBar.h"
+#include "StatusBar.h"
+#include "Button.h"
+#include "WidgetMosaicComp.h"
+#include "AppScreen.h"
+#include "UpDownButton.h"
+#include "Logscreen.h"
+#include "ParamButton.h"
 
-// Always move the steering wheel inside its entire range after switching on the car
-byte limSteeringL = 90, limSteeringR = 90; // usually 45 - 135° (90° is the servo center position)
-int limuSecL = 1500, limuSecR = 1500; // usually 1000 - 2000 uSec (1500 uSec is in the servo center position)
+#include "GUIHal.h"
 
-
-// DANGER!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-// Move velocity: CALIBRATE BY HAND
-// CenterVel depends if 50%-50% or 30%-70%
-int limuSecVelFordward = 1976, limuSecVelReverse = 980, uSecVelCenter=1470; // usually 1000 - 2000 uSec
-int uSecVelDeadBand = 10;
-
-
-// MRSC gain
-//int mrscGain = 90; // 80 This MRSC gain applies, if you don't have an adjustment pot and don't call readInputs()
-double headingMultiplier = 1.0; // adjust until front wheels stay in parallel with the ground, if the car is swiveled around
-
-
-unsigned long lastTimeDebug=0;
-
-unsigned long debugPeriod=5000;
-
-// Debug main
-
-unsigned long lastTimeDebugMain=0;
-unsigned long periodDebugMain=2000;
-
-// MPU library
-
-AccOrientation mpu;
-
-// Enable System
-
-bool enableSystemInput = false;
+GUIHal GUI(128, 64);
 
 // Debug
 
@@ -73,45 +51,31 @@ void debug (String text, T value) {
     Serial.println(value);
 }
 
-// Filtered inputs
 
-FiltreEntradaDigital inputFiltered[4];
-
-// Global variable to share bw tasks
-
-SharedVar<int> gInp[4];
-SharedVar<int> mrscGain;
-
-
-bool wifiEnabled = false;
-
-// State Machine
+// Enable management
+// TODO: Create a specific class
 
 bool stateChangingEnable = false;
 unsigned long initTimeInStateChangingEnable=0;
 bool enableRemote = true;
 
-// Medium Filters
-
-MediumFilter<int> steering(1500);
-MediumFilter<int> vel(1500);
 
 // Tasks definition
+
+TaskHandle_t handTskControl;
+void tskControl (void *pvParameters);
 
 TaskHandle_t handTskWifi;
 void tskWifi (void *pvParameters);
 
-TaskHandle_t handTskLoop;
-void tskLoop (void *pvParameters);
+TaskHandle_t handTskGui;
+void tskGui (void *pvParameters);
 
+TaskHandle_t handTskParam;
+void tskParam (void *pvParameters);
 
-
-///////////////////////////////////////////////////////////////////////////////////
-
-void setup() {
-
-    Serial.begin(115200);
-
+void pinModeConfig () {
+    
     // Configure inputs
     pinMode(INVERSE_MPU_DIRECTION, INPUT_PULLUP);
     pinMode(GAIN_POT, INPUT);
@@ -130,152 +94,28 @@ void setup() {
     pinMode(INPUT_3, INPUT_PULLUP);
     pinMode(INPUT_4, INPUT_PULLUP);
 
-    inputFiltered[0].configura(INPUT_1, 50);
-    inputFiltered[1].configura(INPUT_2, 50);
-    inputFiltered[2].configura(INPUT_3, 50);
-    inputFiltered[3].configura(INPUT_4, 50);
-    
-    // Servo pins
-    servoSteering.attach(OUTPUT_STEERING);
-    servoSteering.write((limSteeringL + limSteeringR) / 2); // Servo to center position
-
-    servoVelocity.attach(OUTPUT_VEL);
-    servoVelocity.writeMicroseconds(uSecVelCenter);
-
-    // MPU 6050 accelerometer / gyro setup
-
-    mpu.begin();
-
-    // RTM Driver (ESP32). Can be used to read any pulse.
-
-    rmtInit();
-
-    // State Machine
-
-    gMode.set(3);
-    enableSystem.set(1);
-
-    xTaskCreateUniversal(tskWifi, "TaskWifi", 10000, NULL, 1, &handTskWifi, 0);
-    delay(500);
-
-    xTaskCreateUniversal(tskLoop, "TaskLoop", 10000, NULL, 1, &handTskLoop, 1);
-    delay(500);
-
-    debug<int>("Ready to Run!", 1);
 }
-
 
 void detectSteeringRange() {
-  // input signal calibration (for center point only)
-  int steeringuSec = rmtValuePWM(0);
-  if (steeringuSec > 500 && steeringuSec < limuSecL) limuSecL = steeringuSec; // around 1000uS
-  if (steeringuSec < 2500 && steeringuSec > limuSecR) limuSecR = steeringuSec; // around 2000uS
+    // input signal calibration (for center point only)
+    int steeringuSec = gValuePWMRot.get();
 
-  // output signal calibration
-  int servoAngle = rmtMapConstrain(0, 45, 135); // The range usually is 45 to 135° (+/- 45°)
-  if (servoAngle > 20 && servoAngle < limSteeringL) limSteeringL = servoAngle;
-  if (servoAngle < 160 && servoAngle > limSteeringR) limSteeringR = servoAngle;
-}
+    paramServo_t paramSteering = gParamServoSteering.get();
 
-
-void readInputs() {
-    mrscGain.set(map(analogRead(GAIN_POT), 0, 1024*4, 0, 100));
-
-    for(int i=0; i<4; i++){
-        gInp[i].set(inputFiltered[i].value());    
-    }
-}
-
-
-void emergencyControl() {
-    servoSteering.writeMicroseconds(limuSecL); // Turn All Left (to avoid going fordward)
-    servoVelocity.writeMicroseconds(uSecVelCenter); // Stop motor
-}
-
-
-void controlMrsc() {
-
-    int steeringAngle;
-    long gyroFeedback;
-    int mrscGainValue = mrscGain.get();
-
-    // Read sensor data
-    mpu.update();
-
-    // Compute steering compensation overlay
-    int steeringPWMFiltered = steering.filter(rmtValuePWM(0));
-    int turnRateSetPoint = map(steeringPWMFiltered, limuSecL, limuSecR, -50, 50); 
-    int steering = abs(turnRateSetPoint);
-    int gain = map(steering, 0, 50, mrscGainValue, (mrscGainValue / 5)); // MRSC gain around center position is 5 times more!
-
-    // Compute velocity Set Point in Eng.Units
-    int velPWMFiltered = vel.filter(rmtValuePWM(1));
-    int uSecVel = velPWMFiltered;
-    if (uSecVel < uSecVelCenter) uSecVel = uSecVelCenter; // If breaking (or reverse?), velSetPoint = 0;
-    int velSetPoint = map(uSecVel, uSecVelCenter, limuSecVelFordward, 0, 100);
-
-    if (steering < 8 && mrscGainValue > 85) { // Straight run @ high gain, "heading hold" mode -------------
-        gyroFeedback = mpu.yawAngleStab * headingMultiplier; // degrees
-
+    if (steeringuSec > 500 && steeringuSec < paramSteering.pwmLimInf) {
+        paramSteering.pwmLimInf = steeringuSec;
+        gParamServoSteering.set(paramSteering); // around 1000uS
     }
 
-    else { // cornering or low gain, correction depending on yaw rate in °/s --------------------------
-        gyroFeedback = mpu.yawRateStab * 50; // degrees/s * speed (always 50%)
-        mpu.resetYawStab();
+    if (steeringuSec < 2500 && steeringuSec > paramSteering.pwmLimSup) {
+        paramSteering.pwmLimSup = steeringuSec;
+        gParamServoSteering.set(paramSteering);  // around 2000uS
     }
 
-    steeringAngle = turnRateSetPoint - (gyroFeedback * gain / 100);
-
-    // TODO
-    // Alternativa !!! amb calcul teòric
-    //theoreticalRatio = V * tg(alfa) / l
-
-    //steeringAngle = turnRateSetPoint + ((theoreticalRatio - mpuInversedRatio * static_cast<int>(mpu.yawRateStab)) * gain) / 100
-
-    steeringAngle = constrain(steeringAngle, -50, 50); // range = -50 to 50
-
-    // Control steering servo
-    int outputWrite = map(steeringAngle, -50, 50, limSteeringL, limSteeringR);
-    servoSteering.write(outputWrite); // 45 - 135°
-
-    // Control velocity. DANGER!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    servoVelocity.writeMicroseconds(rmtValuePWM(1));
-
-    if ((millis() - lastTimeDebug)>debugPeriod) {
-        debug<int>("turnRateSetPoint", turnRateSetPoint);
-        debug<int>("gyroFeedback", gyroFeedback);
-        debug<int>("steering", steering);
-        debug<int>("gain", gain);
-        debug<int>("output", outputWrite);
-        Serial.println("-----");
-
-        lastTimeDebug = millis();
-    }
-
-    gValuePWMRot.set(rmtValuePWM(0)); 
-    gValuePWMVel.set(rmtValuePWM(1));
-
 }
 
-void controlOff() {
-    servoSteering.writeMicroseconds((limuSecL + limuSecR)/2); // Turn All Left (to avoid going fordward)
-    servoVelocity.writeMicroseconds(uSecVelCenter); // Stop motor
-}
-
-void controlManual() {
-    servoSteering.writeMicroseconds(gManTurn.get());
-    servoVelocity.writeMicroseconds(gManVel.get());
-
-}
-
-void controlDirect() {
-    servoSteering.writeMicroseconds(rmtValuePWM(0)); 
-    servoVelocity.writeMicroseconds(rmtValuePWM(1));
-}
 
 void enableManagment() {
-
-    // Enable system control
 
     // TODO: Refactor
 
@@ -293,26 +133,57 @@ void enableManagment() {
 
     // TODO: Hardware filter
 
+    bool enableSystemInput;
+
     if (digitalRead(ENABLE_CONTROL_INPUT) == 1) {
         enableSystemInput = true;
     } else {
         enableSystemInput = false;
     }
     
-    if (enableSystem.get() && enableSystemInput && enableRemote) {
+    if (gEnableSystem.get() && enableSystemInput && enableRemote) {
         digitalWrite(ENABLE_CONTROL, LOW);
     } else {
         digitalWrite(ENABLE_CONTROL, HIGH);
     }
 
-    // Filter input update
-
-    for(int i=0; i<4; i++){
-        inputFiltered[i].update();         
-    }
-
 }
 
+///////////////////////////////////////////////////////////////////////////////////
+
+void setup() {
+
+    Serial.begin(115200);
+
+    pinModeConfig();
+
+    // RTM Driver (ESP32). Can be used to read any pulse.
+
+    rmtInit();
+
+    // State Machine and variables
+
+    gMode.set(3);
+    gEnableSystem.set(1);
+    gMrscGain.set(50);
+    
+    // Task creation
+
+    xTaskCreateUniversal(tskParam, "TaskParam", 10000, NULL, 3, &handTskParam, 0);
+    delay(500);
+
+    xTaskCreateUniversal(tskControl, "TaskControl", 10000, NULL, 1, &handTskControl, 1);
+    delay(500);
+
+    xTaskCreateUniversal(tskWifi, "TaskWifi", 10000, NULL, 2, &handTskWifi, 0);
+    delay(500);
+
+    xTaskCreateUniversal(tskGui, "TaskGui", 10000, NULL, 1, &handTskGui, 0);
+    delay(500);
+    
+
+    debug<int>("Ready to Run!", 1);
+}
 
 // =======================================================================================================
 // MAIN LOOP
@@ -320,7 +191,7 @@ void enableManagment() {
 
 
 void loop() {
-
+    delay(10000);
 }
 
 
@@ -331,35 +202,76 @@ void loop() {
 //
 
 
-void tskLoop(void *pvParameters){
+void tskControl(void *pvParameters){
 
     // SETUP or the task
     Serial.println("Task Loop on core: " + String(xPortGetCoreID()));
+    TickType_t lastTimeTask=0;
+    TickType_t periodTask = pdMS_TO_TICKS(10);
+
+    // Create Servo objects
+    Servo servoSteering;
+    Servo servoVelocity;
+
+    // MPU library
+    bool mpuActive = true;
+
+    AccOrientation mpu;
+    if (mpuActive) mpu.begin();
+
+    // Servo pins
+
+    servoSteering.attach(OUTPUT_STEERING);
+    servoSteering.write(gParamServoSteering.get().pwmCenter); // Servo to center position
+
+    servoVelocity.attach(OUTPUT_VEL);
+    servoVelocity.writeMicroseconds(gParamServoVel.get().pwmCenter);
 
 
+    // Medium Filters
 
-    // Timers Loop Task
+    MediumFilter<int> steeringMediumFilter(1500);
+    MediumFilter<int> velMediumFilter(1500);
 
-    TickType_t lastTimeTaskLoop;
-    TickType_t periodTaskLoop = pdMS_TO_TICKS(10);
+    steeringMediumFilter.enableFilter(true);
+    velMediumFilter.enableFilter(true);
 
     while(true) {
         
-        readInputs(); // Read pots and switches
+        // Move values from interrups (RMT) to global variables
+        // Can be done in any fast task
 
-        detectSteeringRange(); // Detect the steering input signal range
+        gValuePWMRot.set(steeringMediumFilter.filter(rmtValuePWM(0))); 
+        gValuePWMVel.set(velMediumFilter.filter(rmtValuePWM(1)));
 
-        if (gMode.get() == 1) {
-            controlOff();
-        } else if (gMode.get() == 2) {
-            controlDirect();
-        } else if (gMode.get() == 3) {
-            controlMrsc();
-        } else if (gMode.get() == 4) {
-            controlManual();
+        // Read pots
+
+        // TODO: SOLVE POTENCIOMETER!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+        //gMrscGain.set(map(analogRead(GAIN_POT), 0, 1024*4, 0, 100));
+
+        //detectSteeringRange(); // Detect the steering input signal range
+
+        if (mpuActive) mpu.update();
+
+        // Working Modes
+
+        int mode = gMode.get();
+
+        enableManagment();
+
+        if (mode == 1) {
+            controlOff(servoSteering, servoVelocity);
+        } else if (mode == 2) {
+            controlDirect(servoSteering, servoVelocity);
+        } else if (mode == 3) {
+            if (mpuActive) controlMrsc(mpu, servoSteering, servoVelocity);
+            else controlOff(servoSteering, servoVelocity);
+        } else if (mode == 4) {
+            controlManual(servoSteering, servoVelocity);
         } 
 
-        vTaskDelayUntil(&lastTimeTaskLoop, periodTaskLoop);
+        vTaskDelayUntil(&lastTimeTask, periodTask);
     }
 
 }
@@ -375,35 +287,241 @@ void tskWifi(void *pvParameters){
 
     // SETUP or the task
     Serial.println("Task Wifi on core: " + String(xPortGetCoreID()));
+    TickType_t lastTimeDebug=0;
+    TickType_t periodDebug = pdMS_TO_TICKS(50);
+
+    bool wifiEnabled = true;
 
     if (wifiEnabled) InitWifi();
     if (wifiEnabled) Blynk.config(auth);
 
-    TickType_t lastTimeDebugWifi;
-    TickType_t periodDebugWifi = pdMS_TO_TICKS(2000);
+    while(true){
 
-    unsigned long lastTimeBlynk=0;
-    unsigned long periodBlynk=500;
+        if (wifiEnabled) Blynk.run();
+
+        vTaskDelayUntil(&lastTimeDebug, periodDebug);
+    }
+
+}
+
+
+
+//
+// =======================================================================================================
+// TASK Gui
+// =======================================================================================================
+//
+
+
+void tskGui(void *pvParameters){
+
+    // SETUP or the task
+    Serial.println("Task Gui on core: " + String(xPortGetCoreID()));
+    TickType_t lastTime=0;
+    TickType_t period = pdMS_TO_TICKS(100);
+
+    // Declare Gui variables
+
+    paramServo_t paramServoSteering = gParamServoSteering.get();
+    paramServo_t paramServoVel = gParamServoVel.get();
+
+    int pwmSteering = gValuePWMRot.get();
+    int pwmVel = gValuePWMVel.get();
+    
+    bool inputVariables[4];
+
+    // Begin GUI
+
+    GUI.Lcd.begin();
+    
+    //using namespace Codingfield::UI;
+    Codingfield::UI::AppScreen* screen;
+    Codingfield::UI::StatusBar* topBar;
+    Codingfield::UI::ButtonInfoBar* bottomBar;
+    Codingfield::UI::WidgetMosaicComp* mosaic;
+
+    Codingfield::UI::ParamButton* paramMinServoSteering;
+    Codingfield::UI::ParamButton* paramCenterServoSteering;
+    Codingfield::UI::ParamButton* paramMaxServoSteering;
+
+    Codingfield::UI::ParamButton* paramMinServoVel;
+    Codingfield::UI::ParamButton* paramCenterServoVel;
+    Codingfield::UI::ParamButton* paramMaxServoVel;
+
+    Codingfield::UI::Widget* focus;
+
+
+    // Instanciate and configure all widgets
+
+    topBar = new Codingfield::UI::StatusBar();
+    topBar->SetUptime(0);
+    topBar->SetWifiStatus(Codingfield::UI::StatusBar::WifiStatuses::No_signal);
+
+    bottomBar = new Codingfield::UI::ButtonInfoBar();
+    bottomBar->SetButtonAText("<");
+    bottomBar->SetButtonBText("SELECT");
+    bottomBar->SetButtonCText(">");
+
+    mosaic = new Codingfield::UI::WidgetMosaicComp(nullptr, 3, 2, topBar, bottomBar);
+    mosaic->SetBackgroundColor(GUI.Lcd.COLOR_BLACK);
+    mosaic->SetTextColor(GUI.Lcd.COLOR_WHITE);
+    mosaic->SetTitle("Adj Servos");
+    mosaic->SetTextSize(1);
+
+    screen = new Codingfield::UI::AppScreen(Codingfield::UI::Size(128, 64), GUI.Lcd.COLOR_BLACK, topBar, bottomBar, mosaic);
+
+    // Servo Steering Parameter
+
+    paramMinServoSteering = new Codingfield::UI::ParamButton(mosaic, &pwmSteering, &(paramServoSteering.pwmLimInf)); 
+    paramMinServoSteering->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramMinServoSteering->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramMinServoSteering->SetTitle("mS");
+
+    paramCenterServoSteering = new Codingfield::UI::ParamButton(mosaic, &pwmSteering, &(paramServoSteering.pwmCenter)); 
+    paramCenterServoSteering->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramCenterServoSteering->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramCenterServoSteering->SetTitle("cS");
+
+    paramMaxServoSteering = new Codingfield::UI::ParamButton(mosaic, &pwmSteering, &(paramServoSteering.pwmLimSup)); 
+    paramMaxServoSteering->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramMaxServoSteering->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramMaxServoSteering->SetTitle("xS");
+
+    // Servo Vel Parameter
+
+    paramMinServoVel = new Codingfield::UI::ParamButton(mosaic, &pwmVel, &(paramServoVel.pwmLimInf)); 
+    paramMinServoVel->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramMinServoVel->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramMinServoVel->SetTitle("mV");
+
+    paramCenterServoVel = new Codingfield::UI::ParamButton(mosaic, &pwmVel, &(paramServoVel.pwmCenter)); 
+    paramCenterServoVel->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramCenterServoVel->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramCenterServoVel->SetTitle("cV");
+
+    paramMaxServoVel = new Codingfield::UI::ParamButton(mosaic, &pwmVel, &(paramServoVel.pwmLimSup)); 
+    paramMaxServoVel->SetBackgroundColor(GUI.Lcd.COLOR_WHITE);
+    paramMaxServoVel->SetTextColor(GUI.Lcd.COLOR_BLACK);
+    paramMaxServoVel->SetTitle("xV");
+
+    // Give the focus to the main screen
+    focus = mosaic;
+
+    // Draw the screen and all its children
+    //screen->Draw();
+
+    // INPUTS GUI
+
+    FiltreEntradaDigital inputFiltered[4];
+
+    // GUI Buttons definition
+
+    GUI.BtnA.defineVariable(&inputVariables[0]);
+    GUI.BtnB.defineVariable(&inputVariables[1]);
+    GUI.BtnC.defineVariable(&inputVariables[2]);
+
+    const int milisFilter = 50;
+    inputFiltered[0].config(INPUT_1, milisFilter);
+    inputFiltered[1].config(INPUT_2, milisFilter);
+    inputFiltered[2].config(INPUT_3, milisFilter);
+    inputFiltered[3].config(INPUT_4, milisFilter);
+
+
+    while(true){
+        
+        // Move from Globals to GUI Variables
+
+        paramServoSteering = gParamServoSteering.get();
+        paramServoVel = gParamServoVel.get();
+        pwmSteering = gValuePWMRot.get();
+        pwmVel = gValuePWMVel.get();
+
+        // Move from Phisical to GUI Variables
+
+        for(int i=0; i<3; i++) {
+            inputVariables[i] = inputFiltered[i].value();    
+        }
+
+        screen->Draw(focus);
+        GUI.Lcd.update();
+
+        // Move Phisical values to Globals
+
+        for(int i=0; i<4; i++){
+            gInp[i].set(inputFiltered[i].value());    
+        }
+
+        // Move from GUI Variables to Globals (only if they can be modified)
+
+        gParamServoSteering.set(paramServoSteering);
+        gParamServoVel.set(paramServoVel);
+
+        // Phisical inputs filter update
+
+        for(int i=0; i<4; i++){
+            inputFiltered[i].update();         
+        }
+        
+        vTaskDelayUntil(&lastTime, period);
+    }
+
+}
+
+
+
+//
+// =======================================================================================================
+// TASK PARAM
+// =======================================================================================================
+//
+
+void tskParam(void *pvParameters){
+
+    // SETUP or the task
+    Serial.println("Task Param on core: " + String(xPortGetCoreID()));
+    TickType_t lastTime=0;
+    TickType_t period = pdMS_TO_TICKS(1000);
+
+    // Parameters management to be load/saved flash
+
+    ParametersMgmtShared<paramServo_t> parSteeringMgmt("servosStering");
+    ParametersMgmtShared<paramServo_t> parVelMgmt("servosVeloc");
+    
+    // Load servo parameters Steering
+
+    paramServo_t paramServoSteeringDefault;
+    paramServoSteeringDefault.pwmLimInf = 1000;
+    paramServoSteeringDefault.pwmCenter = 1000;
+    paramServoSteeringDefault.pwmLimSup = 1000;
+
+    parSteeringMgmt.load(gParamServoSteering, paramServoSteeringDefault);
+
+    gParamServoSteering.get().println("Load gParamServoSteering");
+
+    // Load servo parameters Vel
+
+    paramServo_t paramServoVelDefault;// = {980, 1470, 1976};
+    paramServoVelDefault.pwmLimInf = 980;
+    paramServoVelDefault.pwmCenter = 1470;
+    paramServoVelDefault.pwmLimSup = 1976;
+
+    parVelMgmt.load(gParamServoVel, paramServoVelDefault);
+    gParamServoVel.get().println("Load gParamServoVel");
 
     while(true){
 
-        for(int i=0; i<4; i++){
-            Serial.println(gInp[i].get());    
-        }
-        Serial.println(mrscGain.get());
+        // Saving parameter if have changed in any task
+        
+        parSteeringMgmt.update(gParamServoSteering);
+        parVelMgmt.update(gParamServoVel);
 
+        gParamServoSteering.get().println("Inside While gParamServoSteer");
+        gParamServoVel.get().println("Inside While gParamServoVel");
 
-        if ((millis() - lastTimeBlynk) > periodBlynk) {
-
-            gValuePWMRot.set(rmtValuePWM(0));
-            gValuePWMVel.set(rmtValuePWM(1));
-
-            if (wifiEnabled) Blynk.run();
-
-            lastTimeBlynk = millis();
-        }
-
-        vTaskDelayUntil(&lastTimeDebugWifi, periodDebugWifi);
+        Serial.print("PWM Rot:"); Serial.println(gValuePWMRot.get());
+        Serial.print("PWM Vel:"); Serial.println(gValuePWMVel.get());
+        
+        vTaskDelayUntil(&lastTime, period);
     }
 
 }

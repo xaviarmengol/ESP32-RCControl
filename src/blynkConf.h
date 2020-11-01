@@ -1,12 +1,5 @@
 #include <BlynkSimpleEsp32_SSL.h>
-#include "SharedVar.h"
-
-SharedVar<int> gManVel;
-SharedVar<int> gManTurn;
-SharedVar<int> gMode; 
-SharedVar<int> gValuePWMRot;
-SharedVar<int> gValuePWMVel;
-SharedVar<bool> enableSystem;
+#include "globalVars.h"
 
 BLYNK_WRITE(V0) { // Joystick
     gManTurn.set(param.asInt());
@@ -30,7 +23,7 @@ BLYNK_READ(V4) { // PWM VEL
 
 BLYNK_WRITE(V5) { // Enable Button
 
-    enableSystem.set(param.asInt() == 1);
+    gEnableSystem.set(param.asInt() == 1);
 
 }
 

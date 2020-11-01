@@ -40,7 +40,7 @@ bool iniNTP(){
 static void InitWifi() {
     Serial.println(" > WiFi");
     Serial.println("Connecting...");
-    WiFi.begin(SSID, SSIDPASS);
+    WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
